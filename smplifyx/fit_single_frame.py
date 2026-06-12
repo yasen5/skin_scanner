@@ -43,7 +43,7 @@ import PIL.Image as pil_img
 from optimizers import optim_factory
 
 import fitting
-from human_body_prior.tools.model_loader import load_vposer
+from vposer_utils import decode_vposer, load_vposer_model
 
 
 def fit_single_frame(img,
@@ -185,15 +185,19 @@ def fit_single_frame(img,
                                      requires_grad=True)
 
         vposer_ckpt = osp.expandvars(vposer_ckpt)
-        vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
+        vposer, _ = load_vposer_model(vposer_ckpt)
         vposer = vposer.to(device=device)
         vposer.eval()
 
     if use_vposer:
         body_mean_pose = torch.zeros([batch_size, vposer_latent_dim],
                                      dtype=dtype)
-    else:
+    elif hasattr(body_pose_prior, 'get_mean'):
         body_mean_pose = body_pose_prior.get_mean().detach().cpu()
+    elif hasattr(body_model, 'body_pose'):
+        body_mean_pose = body_model.body_pose.detach().cpu()
+    else:
+        body_mean_pose = torch.zeros([batch_size, 63], dtype=dtype)
 
     keypoint_data = torch.tensor(keypoints, dtype=dtype)
     gt_joints = keypoint_data[:, :, :2]
@@ -483,9 +487,8 @@ def fit_single_frame(img,
             pickle.dump(results[min_idx]['result'], result_file, protocol=2)
 
     if save_meshes or visualize:
-        body_pose = vposer.decode(
-            pose_embedding,
-            output_type='aa').view(1, -1) if use_vposer else None
+        body_pose = decode_vposer(
+            vposer, pose_embedding) if use_vposer else None
 
         model_type = kwargs.get('model_type', 'smpl')
         append_wrists = model_type == 'smpl' and use_vposer

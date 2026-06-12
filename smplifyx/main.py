@@ -37,6 +37,7 @@ from fit_single_frame import fit_single_frame
 
 from camera import create_camera
 from prior import create_prior
+from vposer_utils import load_vposer_model
 
 torch.backends.cudnn.enabled = False
 
@@ -96,6 +97,14 @@ def main(**args):
         dtype = torch.float32
     else:
         raise ValueError('Unknown float type {}, exiting!'.format(float_dtype))
+
+    if args.get('use_vposer', True):
+        try:
+            load_vposer_model(args.get('vposer_ckpt', ''))
+        except Exception as exc:
+            raise RuntimeError(
+                'VPoser is required but could not be loaded from {}: {}'.
+                format(args.get('vposer_ckpt', ''), exc))
 
     joint_mapper = JointMapper(dataset_obj.get_model2data())
 
