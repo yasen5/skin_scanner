@@ -31,45 +31,45 @@ def _add_vposer_source_to_path(expr_dir):
 def _load_vposer_v1(expr_dir):
     import torch
 
-    ckpts = sorted(glob.glob(osp.join(expr_dir, 'snapshots', '*.pt')),
-                   key=osp.getmtime)
-    if not ckpts:
+    checkpoint_paths = sorted(glob.glob(osp.join(expr_dir, 'snapshots', '*.pt')),
+                              key=osp.getmtime)
+    if not checkpoint_paths:
         raise FileNotFoundError(
             'No VPoser v1 checkpoint found at {}'.format(
                 osp.join(expr_dir, 'snapshots', '*.pt')))
 
-    model_code = osp.join(expr_dir, 'vposer_smpl.py')
-    if not osp.exists(model_code):
+    model_code_path = osp.join(expr_dir, 'vposer_smpl.py')
+    if not osp.exists(model_code_path):
         raise FileNotFoundError(
-            'No VPoser v1 model definition found at {}'.format(model_code))
+            'No VPoser v1 model definition found at {}'.format(model_code_path))
 
-    config_fns = sorted(glob.glob(osp.join(expr_dir, '*.ini')))
-    if not config_fns:
+    config_paths = sorted(glob.glob(osp.join(expr_dir, '*.ini')))
+    if not config_paths:
         raise FileNotFoundError(
             'No VPoser v1 config .ini found in {}'.format(expr_dir))
 
     parser = configparser.ConfigParser()
-    parser.read(config_fns[0])
-    cfg = parser['All']
+    parser.read(config_paths[0])
+    config = parser['All']
 
-    spec = importlib.util.spec_from_file_location('vposer_smpl', model_code)
+    spec = importlib.util.spec_from_file_location('vposer_smpl', model_code_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
     model = module.VPoser(
-        num_neurons=cfg.getint('num_neurons'),
-        latentD=cfg.getint('latentD'),
-        data_shape=ast.literal_eval(cfg.get('data_shape')),
-        use_cont_repr=cfg.getboolean('use_cont_repr'))
+        neuron_count=config.getint('num_neurons'),
+        latent_dimension=config.getint('latentD'),
+        data_shape=ast.literal_eval(config.get('data_shape')),
+        use_continuous_representation=config.getboolean('use_cont_repr'))
 
-    state_dict = torch.load(ckpts[-1], map_location=torch.device('cpu'))
+    state_dict = torch.load(checkpoint_paths[-1], map_location=torch.device('cpu'))
     if isinstance(state_dict, dict) and 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
     model.load_state_dict(state_dict, strict=True)
     for param in model.parameters():
         param.requires_grad = False
     model.eval()
-    return model, cfg
+    return model, config
 
 
 def load_vposer_model(expr_dir):
@@ -95,16 +95,17 @@ def load_vposer_model(expr_dir):
 def _rotation_matrix_to_angle_axis(rotation_matrix):
     import torch
 
-    rot = rotation_matrix.reshape(-1, 3, 3)
-    cos_angle = ((rot[:, 0, 0] + rot[:, 1, 1] + rot[:, 2, 2] - 1.0) *
-                 0.5).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    rotations = rotation_matrix.reshape(-1, 3, 3)
+    cos_angle = (
+        (rotations[:, 0, 0] + rotations[:, 1, 1] +
+         rotations[:, 2, 2] - 1.0) * 0.5).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
     angle = torch.acos(cos_angle)
     sin_angle = torch.sin(angle)
 
     axis = torch.stack([
-        rot[:, 2, 1] - rot[:, 1, 2],
-        rot[:, 0, 2] - rot[:, 2, 0],
-        rot[:, 1, 0] - rot[:, 0, 1],
+        rotations[:, 2, 1] - rotations[:, 1, 2],
+        rotations[:, 0, 2] - rotations[:, 2, 0],
+        rotations[:, 1, 0] - rotations[:, 0, 1],
     ], dim=1)
 
     scale = angle / (2.0 * sin_angle)

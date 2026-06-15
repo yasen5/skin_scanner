@@ -6,10 +6,10 @@ controlnet_aux, which re-implements the same CMU OpenPose neural network in
 PyTorch and downloads model weights from Hugging Face automatically.
 
 The public API is identical to the playing_smplifyx openpose_wrapper.py:
-    datum = detect_keypoints(image_bgr_np)
-    datum.poseKeypoints  -> (N, 25, 3) BODY_25 body keypoints [x, y, conf]
-    datum.handKeypoints  -> [left (N,21,3), right (N,21,3)]
-    datum.faceKeypoints  -> (N, 70, 3)
+    openpose_result = detect_keypoints(image_bgr_np)
+    openpose_result.poseKeypoints  -> (N, 25, 3) BODY_25 body keypoints [x, y, confidence]
+    openpose_result.handKeypoints  -> [left (N,21,3), right (N,21,3)]
+    openpose_result.faceKeypoints  -> (N, 70, 3)
 """
 
 import numpy as np
@@ -57,47 +57,52 @@ _COCO18_FROM_BODY25 = {
 }
 
 
-def _keypoints_to_array(kp_list, n_joints, H, W):
+def _keypoints_to_array(keypoint_list, joint_count, image_height, image_width):
     """Convert a list of Keypoint namedtuples (or None) to an (n_joints, 3) array.
 
     Keypoints have normalised x/y ∈ [0,1]; we convert to pixel coordinates.
     Undetected keypoints (None) or sentinel (-1,-1) are returned with confidence 0.
     """
-    arr = np.zeros((n_joints, 3), dtype=np.float32)
-    for i, kp in enumerate(kp_list):
-        if i >= n_joints:
+    keypoint_array = np.zeros((joint_count, 3), dtype=np.float32)
+    for joint_index, keypoint in enumerate(keypoint_list):
+        if joint_index >= joint_count:
             break
-        if kp is not None and kp.x >= 0 and kp.y >= 0:
-            arr[i, 0] = kp.x * W
-            arr[i, 1] = kp.y * H
-            arr[i, 2] = float(kp.score) if kp.score is not None else 1.0
-    return arr
+        if keypoint is not None and keypoint.x >= 0 and keypoint.y >= 0:
+            keypoint_array[joint_index, 0] = keypoint.x * image_width
+            keypoint_array[joint_index, 1] = keypoint.y * image_height
+            keypoint_array[joint_index, 2] = (
+                float(keypoint.score) if keypoint.score is not None else 1.0)
+    return keypoint_array
 
 
-def _coco18_to_body25(coco18, H, W):
+def _coco18_to_body25(coco18_keypoints, image_height, image_width):
     """Convert a list of 18 COCO Keypoints to a (25, 3) BODY_25 array."""
-    body25 = np.zeros((25, 3), dtype=np.float32)
+    body25_keypoints = np.zeros((25, 3), dtype=np.float32)
 
-    for b25_idx, c18_idx in _COCO18_FROM_BODY25.items():
-        kp = coco18[c18_idx] if c18_idx < len(coco18) else None
-        if kp is not None and kp.x >= 0 and kp.y >= 0:
-            body25[b25_idx, 0] = kp.x * W
-            body25[b25_idx, 1] = kp.y * H
-            body25[b25_idx, 2] = float(kp.score) if kp.score is not None else 1.0
+    for body25_index, coco18_index in _COCO18_FROM_BODY25.items():
+        keypoint = (
+            coco18_keypoints[coco18_index]
+            if coco18_index < len(coco18_keypoints) else None)
+        if keypoint is not None and keypoint.x >= 0 and keypoint.y >= 0:
+            body25_keypoints[body25_index, 0] = keypoint.x * image_width
+            body25_keypoints[body25_index, 1] = keypoint.y * image_height
+            body25_keypoints[body25_index, 2] = (
+                float(keypoint.score) if keypoint.score is not None else 1.0)
 
     # MidHip (index 8) = midpoint of RHip (COCO18[8]) and LHip (COCO18[11])
-    r_hip = coco18[8] if len(coco18) > 8 else None
-    l_hip = coco18[11] if len(coco18) > 11 else None
-    if (r_hip is not None and l_hip is not None and
-            r_hip.x >= 0 and r_hip.y >= 0 and l_hip.x >= 0 and l_hip.y >= 0):
-        body25[8, 0] = (r_hip.x + l_hip.x) * 0.5 * W
-        body25[8, 1] = (r_hip.y + l_hip.y) * 0.5 * H
-        body25[8, 2] = min(
-            float(r_hip.score) if r_hip.score is not None else 1.0,
-            float(l_hip.score) if l_hip.score is not None else 1.0,
+    right_hip = coco18_keypoints[8] if len(coco18_keypoints) > 8 else None
+    left_hip = coco18_keypoints[11] if len(coco18_keypoints) > 11 else None
+    if (right_hip is not None and left_hip is not None and
+            right_hip.x >= 0 and right_hip.y >= 0 and
+            left_hip.x >= 0 and left_hip.y >= 0):
+        body25_keypoints[8, 0] = (right_hip.x + left_hip.x) * 0.5 * image_width
+        body25_keypoints[8, 1] = (right_hip.y + left_hip.y) * 0.5 * image_height
+        body25_keypoints[8, 2] = min(
+            float(right_hip.score) if right_hip.score is not None else 1.0,
+            float(left_hip.score) if left_hip.score is not None else 1.0,
         )
 
-    return body25
+    return body25_keypoints
 
 
 def _remap_hf_to_timm(hf_weights):
@@ -106,9 +111,9 @@ def _remap_hf_to_timm(hf_weights):
     The key difference is that HF stores Q, K, V as separate linear layers while
     timm merges them into a single QKV projection (shape [3*D, D]).
     """
-    timm_sd = {}
+    timm_state_dict = {}
 
-    simple = {
+    direct_key_map = {
         'classifier.weight':                              'head.weight',
         'classifier.bias':                                'head.bias',
         'vit.embeddings.cls_token':                       'cls_token',
@@ -118,64 +123,76 @@ def _remap_hf_to_timm(hf_weights):
         'vit.layernorm.weight':                           'norm.weight',
         'vit.layernorm.bias':                             'norm.bias',
     }
-    for hf_key, timm_key in simple.items():
-        timm_sd[timm_key] = hf_weights[hf_key]
+    for huggingface_key, timm_key in direct_key_map.items():
+        timm_state_dict[timm_key] = hf_weights[huggingface_key]
 
-    for i in range(12):
-        hf = f'vit.encoder.layer.{i}'
-        tm = f'blocks.{i}'
+    for layer_index in range(12):
+        huggingface_prefix = f'vit.encoder.layer.{layer_index}'
+        timm_prefix = f'blocks.{layer_index}'
 
-        timm_sd[f'{tm}.norm1.weight'] = hf_weights[f'{hf}.layernorm_before.weight']
-        timm_sd[f'{tm}.norm1.bias']   = hf_weights[f'{hf}.layernorm_before.bias']
+        timm_state_dict[f'{timm_prefix}.norm1.weight'] = (
+            hf_weights[f'{huggingface_prefix}.layernorm_before.weight'])
+        timm_state_dict[f'{timm_prefix}.norm1.bias'] = (
+            hf_weights[f'{huggingface_prefix}.layernorm_before.bias'])
 
-        q_w = hf_weights[f'{hf}.attention.attention.query.weight']
-        k_w = hf_weights[f'{hf}.attention.attention.key.weight']
-        v_w = hf_weights[f'{hf}.attention.attention.value.weight']
-        timm_sd[f'{tm}.attn.qkv.weight'] = torch.cat([q_w, k_w, v_w], dim=0)
+        query_weight = hf_weights[f'{huggingface_prefix}.attention.attention.query.weight']
+        key_weight = hf_weights[f'{huggingface_prefix}.attention.attention.key.weight']
+        value_weight = hf_weights[f'{huggingface_prefix}.attention.attention.value.weight']
+        timm_state_dict[f'{timm_prefix}.attn.qkv.weight'] = torch.cat(
+            [query_weight, key_weight, value_weight], dim=0)
 
-        q_b = hf_weights[f'{hf}.attention.attention.query.bias']
-        k_b = hf_weights[f'{hf}.attention.attention.key.bias']
-        v_b = hf_weights[f'{hf}.attention.attention.value.bias']
-        timm_sd[f'{tm}.attn.qkv.bias'] = torch.cat([q_b, k_b, v_b], dim=0)
+        query_bias = hf_weights[f'{huggingface_prefix}.attention.attention.query.bias']
+        key_bias = hf_weights[f'{huggingface_prefix}.attention.attention.key.bias']
+        value_bias = hf_weights[f'{huggingface_prefix}.attention.attention.value.bias']
+        timm_state_dict[f'{timm_prefix}.attn.qkv.bias'] = torch.cat(
+            [query_bias, key_bias, value_bias], dim=0)
 
-        timm_sd[f'{tm}.attn.proj.weight'] = hf_weights[f'{hf}.attention.output.dense.weight']
-        timm_sd[f'{tm}.attn.proj.bias']   = hf_weights[f'{hf}.attention.output.dense.bias']
+        timm_state_dict[f'{timm_prefix}.attn.proj.weight'] = (
+            hf_weights[f'{huggingface_prefix}.attention.output.dense.weight'])
+        timm_state_dict[f'{timm_prefix}.attn.proj.bias'] = (
+            hf_weights[f'{huggingface_prefix}.attention.output.dense.bias'])
 
-        timm_sd[f'{tm}.norm2.weight'] = hf_weights[f'{hf}.layernorm_after.weight']
-        timm_sd[f'{tm}.norm2.bias']   = hf_weights[f'{hf}.layernorm_after.bias']
+        timm_state_dict[f'{timm_prefix}.norm2.weight'] = (
+            hf_weights[f'{huggingface_prefix}.layernorm_after.weight'])
+        timm_state_dict[f'{timm_prefix}.norm2.bias'] = (
+            hf_weights[f'{huggingface_prefix}.layernorm_after.bias'])
 
-        timm_sd[f'{tm}.mlp.fc1.weight'] = hf_weights[f'{hf}.intermediate.dense.weight']
-        timm_sd[f'{tm}.mlp.fc1.bias']   = hf_weights[f'{hf}.intermediate.dense.bias']
+        timm_state_dict[f'{timm_prefix}.mlp.fc1.weight'] = (
+            hf_weights[f'{huggingface_prefix}.intermediate.dense.weight'])
+        timm_state_dict[f'{timm_prefix}.mlp.fc1.bias'] = (
+            hf_weights[f'{huggingface_prefix}.intermediate.dense.bias'])
 
-        timm_sd[f'{tm}.mlp.fc2.weight'] = hf_weights[f'{hf}.output.dense.weight']
-        timm_sd[f'{tm}.mlp.fc2.bias']   = hf_weights[f'{hf}.output.dense.bias']
+        timm_state_dict[f'{timm_prefix}.mlp.fc2.weight'] = (
+            hf_weights[f'{huggingface_prefix}.output.dense.weight'])
+        timm_state_dict[f'{timm_prefix}.mlp.fc2.bias'] = (
+            hf_weights[f'{huggingface_prefix}.output.dense.bias'])
 
-    return timm_sd
+    return timm_state_dict
 
 
-def _crop_person(image_rgb, kps_body25, pad_frac=0.15):
+def _crop_person(image_rgb, body25_keypoints, padding_fraction=0.15):
     """Return a tight bounding-box crop of one person using their BODY_25 keypoints.
 
-    kps_body25: (25, 3) pixel-coord array (x, y, conf).
+    body25_keypoints: (25, 3) pixel-coord array (x, y, confidence).
     Returns an H×W×3 uint8 RGB array, or None if fewer than 2 joints are visible.
     """
-    visible = kps_body25[kps_body25[:, 2] > 0.1]
+    visible = body25_keypoints[body25_keypoints[:, 2] > 0.1]
     if len(visible) < 2:
         return None
-    H, W = image_rgb.shape[:2]
-    x0 = visible[:, 0].min()
-    y0 = visible[:, 1].min()
-    x1 = visible[:, 0].max()
-    y1 = visible[:, 1].max()
-    pad_x = (x1 - x0) * pad_frac
-    pad_y = (y1 - y0) * pad_frac
-    x0 = max(0, int(x0 - pad_x))
-    y0 = max(0, int(y0 - pad_y))
-    x1 = min(W, int(x1 + pad_x))
-    y1 = min(H, int(y1 + pad_y))
-    if x1 <= x0 or y1 <= y0:
+    image_height, image_width = image_rgb.shape[:2]
+    min_x = visible[:, 0].min()
+    min_y = visible[:, 1].min()
+    max_x = visible[:, 0].max()
+    max_y = visible[:, 1].max()
+    padding_x = (max_x - min_x) * padding_fraction
+    padding_y = (max_y - min_y) * padding_fraction
+    min_x = max(0, int(min_x - padding_x))
+    min_y = max(0, int(min_y - padding_y))
+    max_x = min(image_width, int(max_x + padding_x))
+    max_y = min(image_height, int(max_y + padding_y))
+    if max_x <= min_x or max_y <= min_y:
         return None
-    return image_rgb[y0:y1, x0:x1]
+    return image_rgb[min_y:max_y, min_x:max_x]
 
 
 class _GenderClassifier:
@@ -202,29 +219,33 @@ class _GenderClassifier:
         self._model.load_state_dict(_remap_hf_to_timm(hf_weights))
         self._model.eval()
 
-    def predict(self, image_rgb_uint8, kps_body25):
-        """Return 'female' or 'male' for the person described by kps_body25.
+    def predict(self, image_rgb_uint8, body25_keypoints):
+        """Return 'female' or 'male' for the person described by body25_keypoints.
 
         Falls back to 'neutral' when the crop is too small to be reliable.
         """
-        crop = _crop_person(image_rgb_uint8, kps_body25)
+        crop = _crop_person(image_rgb_uint8, body25_keypoints)
         if crop is None:
             return 'neutral'
 
         # Pad to square before resizing to avoid aspect-ratio distortion
-        h, w = crop.shape[:2]
-        side = max(h, w)
-        padded = np.zeros((side, side, 3), dtype=np.uint8)
-        padded[(side - h) // 2:(side - h) // 2 + h,
-               (side - w) // 2:(side - w) // 2 + w] = crop
-        img = Image.fromarray(padded).resize((224, 224), Image.BILINEAR)
-        t = TF.to_tensor(img)                            # [0, 1]
-        t = TF.normalize(t, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])   # [-1, 1]
-        t = t.unsqueeze(0)
+        crop_height, crop_width = crop.shape[:2]
+        square_side = max(crop_height, crop_width)
+        padded_crop = np.zeros((square_side, square_side, 3), dtype=np.uint8)
+        padded_crop[
+            (square_side - crop_height) // 2:
+            (square_side - crop_height) // 2 + crop_height,
+            (square_side - crop_width) // 2:
+            (square_side - crop_width) // 2 + crop_width] = crop
+        crop_image = Image.fromarray(padded_crop).resize((224, 224), Image.BILINEAR)
+        image_tensor = TF.to_tensor(crop_image)                            # [0, 1]
+        image_tensor = TF.normalize(
+            image_tensor, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])   # [-1, 1]
+        image_tensor = image_tensor.unsqueeze(0)
 
         with torch.no_grad():
-            pred = self._model(t).argmax(dim=1).item()
-        return self._LABELS[pred]
+            predicted_label_index = self._model(image_tensor).argmax(dim=1).item()
+        return self._LABELS[predicted_label_index]
 
 
 _gender_clf = None   # loaded lazily on first call to detect_keypoints
@@ -232,13 +253,14 @@ _gender_clf = None   # loaded lazily on first call to detect_keypoints
 
 class _Datum:
     """Minimal stand-in for pyopenpose's Datum; holds the detected arrays."""
-    def __init__(self, pose_kps, hand_kps_left, hand_kps_right, face_kps,
-                 gender_pd=None):
-        self.poseKeypoints = pose_kps          # (N, 25, 3)
-        self.handKeypoints = [hand_kps_left,   # (N, 21, 3)
-                              hand_kps_right]  # (N, 21, 3)
-        self.faceKeypoints = face_kps          # (N, 70, 3)
-        self.gender_pd = gender_pd or []       # list[str] length N
+    def __init__(self, pose_keypoints, left_hand_keypoints,
+                 right_hand_keypoints, face_keypoints,
+                 predicted_genders=None):
+        self.poseKeypoints = pose_keypoints           # (N, 25, 3)
+        self.handKeypoints = [left_hand_keypoints,    # (N, 21, 3)
+                              right_hand_keypoints]   # (N, 21, 3)
+        self.faceKeypoints = face_keypoints           # (N, 70, 3)
+        self.gender_pd = predicted_genders or []      # list[str] length N
 
 
 def detect_keypoints(image_bgr):
@@ -250,7 +272,7 @@ def detect_keypoints(image_bgr):
     """
     global _gender_clf
 
-    H, W = image_bgr.shape[:2]
+    image_height, image_width = image_bgr.shape[:2]
 
     poses = _detector.detect_poses(
         image_bgr,
@@ -260,29 +282,37 @@ def detect_keypoints(image_bgr):
 
     if not poses:
         empty = np.zeros((0, 1, 3), dtype=np.float32)
-        return _Datum(empty, empty, empty, empty, gender_pd=[])
+        return _Datum(empty, empty, empty, empty, predicted_genders=[])
 
-    n = len(poses)
-    pose_kps  = np.zeros((n, 25, 3), dtype=np.float32)
-    lhand_kps = np.zeros((n, 21, 3), dtype=np.float32)
-    rhand_kps = np.zeros((n, 21, 3), dtype=np.float32)
-    face_kps  = np.zeros((n, 70, 3), dtype=np.float32)
+    person_count = len(poses)
+    pose_keypoints = np.zeros((person_count, 25, 3), dtype=np.float32)
+    left_hand_keypoints = np.zeros((person_count, 21, 3), dtype=np.float32)
+    right_hand_keypoints = np.zeros((person_count, 21, 3), dtype=np.float32)
+    face_keypoints = np.zeros((person_count, 70, 3), dtype=np.float32)
 
-    for i, pose in enumerate(poses):
-        pose_kps[i] = _coco18_to_body25(pose.body.keypoints, H, W)
+    for person_index, pose in enumerate(poses):
+        pose_keypoints[person_index] = _coco18_to_body25(
+            pose.body.keypoints, image_height, image_width)
         if pose.left_hand is not None:
-            lhand_kps[i] = _keypoints_to_array(pose.left_hand, 21, H, W)
+            left_hand_keypoints[person_index] = _keypoints_to_array(
+                pose.left_hand, 21, image_height, image_width)
         if pose.right_hand is not None:
-            rhand_kps[i] = _keypoints_to_array(pose.right_hand, 21, H, W)
+            right_hand_keypoints[person_index] = _keypoints_to_array(
+                pose.right_hand, 21, image_height, image_width)
         if pose.face is not None:
-            face_kps[i] = _keypoints_to_array(pose.face, 70, H, W)
+            face_keypoints[person_index] = _keypoints_to_array(
+                pose.face, 70, image_height, image_width)
 
     # Gender classification — load model once, then predict per person
     if _gender_clf is None:
         _gender_clf = _GenderClassifier()
 
     image_rgb = image_bgr[:, :, ::-1].copy()   # BGR → RGB uint8
-    gender_pd = [_gender_clf.predict(image_rgb, pose_kps[i]) for i in range(n)]
-    print(f'Gender predictions: {gender_pd}')
+    predicted_genders = [
+        _gender_clf.predict(image_rgb, pose_keypoints[person_index])
+        for person_index in range(person_count)]
+    print(f'Gender predictions: {predicted_genders}')
 
-    return _Datum(pose_kps, lhand_kps, rhand_kps, face_kps, gender_pd=gender_pd)
+    return _Datum(
+        pose_keypoints, left_hand_keypoints, right_hand_keypoints,
+        face_keypoints, predicted_genders=predicted_genders)

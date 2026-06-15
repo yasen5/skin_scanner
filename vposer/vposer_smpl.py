@@ -29,7 +29,9 @@ A human body pose prior built with Auto-Encoding Variational Bayes
 
 __all__ = ['VPoser']
 
-import os, sys, shutil
+import os
+import shutil
+import sys
 
 import torch
 
@@ -47,99 +49,132 @@ class ContinousRotReprDecoder(nn.Module):
     def forward(self, module_input):
         reshaped_input = module_input.view(-1, 3, 2)
 
-        b1 = F.normalize(reshaped_input[:, :, 0], dim=1)
+        first_basis_vector = F.normalize(reshaped_input[:, :, 0], dim=1)
 
-        dot_prod = torch.sum(b1 * reshaped_input[:, :, 1], dim=1, keepdim=True)
-        b2 = F.normalize(reshaped_input[:, :, 1] - dot_prod * b1, dim=-1)
-        b3 = torch.cross(b1, b2, dim=1)
+        dot_product = torch.sum(
+            first_basis_vector * reshaped_input[:, :, 1], dim=1, keepdim=True)
+        second_basis_vector = F.normalize(
+            reshaped_input[:, :, 1] - dot_product * first_basis_vector, dim=-1)
+        third_basis_vector = torch.cross(
+            first_basis_vector, second_basis_vector, dim=1)
 
-        return torch.stack([b1, b2, b3], dim=-1)
+        return torch.stack(
+            [first_basis_vector, second_basis_vector, third_basis_vector],
+            dim=-1)
 
 
 class VPoser(nn.Module):
-    def __init__(self, num_neurons, latentD, data_shape, use_cont_repr=True):
+    def __init__(self, neuron_count=None, latent_dimension=None,
+                 data_shape=None, use_continuous_representation=None,
+                 **legacy_kwargs):
         super(VPoser, self).__init__()
 
-        self.latentD = latentD
-        self.use_cont_repr = use_cont_repr
+        if neuron_count is None:
+            neuron_count = legacy_kwargs.pop('num_neurons')
+        if latent_dimension is None:
+            latent_dimension = legacy_kwargs.pop('latentD')
+        if data_shape is None:
+            data_shape = legacy_kwargs.pop('data_shape')
+        if use_continuous_representation is None:
+            use_continuous_representation = legacy_kwargs.pop(
+                'use_cont_repr', True)
 
-        n_features = np.prod(data_shape)
-        self.num_joints = data_shape[1]
+        self.latent_dimension = latent_dimension
+        self.use_continuous_representation = use_continuous_representation
 
-        self.bodyprior_enc_bn1 = nn.BatchNorm1d(n_features)
-        self.bodyprior_enc_fc1 = nn.Linear(n_features, num_neurons)
-        self.bodyprior_enc_bn2 = nn.BatchNorm1d(num_neurons)
-        self.bodyprior_enc_fc2 = nn.Linear(num_neurons, num_neurons)
-        self.bodyprior_enc_mu = nn.Linear(num_neurons, latentD)
-        self.bodyprior_enc_logvar = nn.Linear(num_neurons, latentD)
+        feature_count = np.prod(data_shape)
+        self.joint_count = data_shape[1]
+
+        self.bodyprior_enc_bn1 = nn.BatchNorm1d(feature_count)
+        self.bodyprior_enc_fc1 = nn.Linear(feature_count, neuron_count)
+        self.bodyprior_enc_bn2 = nn.BatchNorm1d(neuron_count)
+        self.bodyprior_enc_fc2 = nn.Linear(neuron_count, neuron_count)
+        self.bodyprior_enc_mu = nn.Linear(neuron_count, latent_dimension)
+        self.bodyprior_enc_logvar = nn.Linear(neuron_count, latent_dimension)
         self.dropout = nn.Dropout(p=.1, inplace=False)
 
-        self.bodyprior_dec_fc1 = nn.Linear(latentD, num_neurons)
-        self.bodyprior_dec_fc2 = nn.Linear(num_neurons, num_neurons)
+        self.bodyprior_dec_fc1 = nn.Linear(latent_dimension, neuron_count)
+        self.bodyprior_dec_fc2 = nn.Linear(neuron_count, neuron_count)
 
-        if self.use_cont_repr:
+        if self.use_continuous_representation:
             self.rot_decoder = ContinousRotReprDecoder()
 
-        self.bodyprior_dec_out = nn.Linear(num_neurons, self.num_joints* 6)
+        self.bodyprior_dec_out = nn.Linear(neuron_count, self.joint_count * 6)
 
-    def encode(self, Pin):
+    def encode(self, pose_input):
         '''
 
-        :param Pin: Nx(numjoints*3)
+        :param pose_input: Nx(numjoints*3)
         :param rep_type: 'matrot'/'aa' for matrix rotations or axis-angle
         :return:
         '''
-        Xout = Pin.view(Pin.size(0), -1)  # flatten input
-        Xout = self.bodyprior_enc_bn1(Xout)
+        encoded_pose = pose_input.view(pose_input.size(0), -1)  # flatten input
+        encoded_pose = self.bodyprior_enc_bn1(encoded_pose)
 
-        Xout = F.leaky_relu(self.bodyprior_enc_fc1(Xout), negative_slope=.2)
-        Xout = self.bodyprior_enc_bn2(Xout)
-        Xout = self.dropout(Xout)
-        Xout = F.leaky_relu(self.bodyprior_enc_fc2(Xout), negative_slope=.2)
-        return torch.distributions.normal.Normal(self.bodyprior_enc_mu(Xout), F.softplus(self.bodyprior_enc_logvar(Xout)))
+        encoded_pose = F.leaky_relu(
+            self.bodyprior_enc_fc1(encoded_pose), negative_slope=.2)
+        encoded_pose = self.bodyprior_enc_bn2(encoded_pose)
+        encoded_pose = self.dropout(encoded_pose)
+        encoded_pose = F.leaky_relu(
+            self.bodyprior_enc_fc2(encoded_pose), negative_slope=.2)
+        return torch.distributions.normal.Normal(
+            self.bodyprior_enc_mu(encoded_pose),
+            F.softplus(self.bodyprior_enc_logvar(encoded_pose)))
 
-    def decode(self, Zin, output_type='matrot'):
+    def decode(self, latent_input, output_type='matrot'):
         assert output_type in ['matrot', 'aa']
 
-        Xout = F.leaky_relu(self.bodyprior_dec_fc1(Zin), negative_slope=.2)
-        Xout = self.dropout(Xout)
-        Xout = F.leaky_relu(self.bodyprior_dec_fc2(Xout), negative_slope=.2)
-        Xout = self.bodyprior_dec_out(Xout)
-        if self.use_cont_repr:
-            Xout = self.rot_decoder(Xout)
+        decoded_pose = F.leaky_relu(
+            self.bodyprior_dec_fc1(latent_input), negative_slope=.2)
+        decoded_pose = self.dropout(decoded_pose)
+        decoded_pose = F.leaky_relu(
+            self.bodyprior_dec_fc2(decoded_pose), negative_slope=.2)
+        decoded_pose = self.bodyprior_dec_out(decoded_pose)
+        if self.use_continuous_representation:
+            decoded_pose = self.rot_decoder(decoded_pose)
         else:
-            Xout = torch.tanh(Xout)
+            decoded_pose = torch.tanh(decoded_pose)
 
-        Xout = Xout.view([-1, 1, self.num_joints, 9])
-        if output_type == 'aa': return VPoser.matrot2aa(Xout)
-        return Xout
+        decoded_pose = decoded_pose.view([-1, 1, self.joint_count, 9])
+        if output_type == 'aa':
+            return VPoser.matrot2aa(decoded_pose)
+        return decoded_pose
 
-    def forward(self, Pin, input_type='matrot', output_type='matrot'):
+    def forward(self, pose_input, input_type='matrot', output_type='matrot'):
         '''
 
-        :param Pin: aa: Nx1xnum_jointsx3 / matrot: Nx1xnum_jointsx9
+        :param pose_input: aa: Nx1xnum_jointsx3 / matrot: Nx1xnum_jointsx9
         :param input_type: matrot / aa for matrix rotations or axis angles
         :param output_type: matrot / aa
         :return:
         '''
         assert output_type in ['matrot', 'aa']
-        # if input_type == 'aa': Pin = VPoser.aa2matrot(Pin)
-        q_z = self.encode(Pin)
-        q_z_sample = q_z.rsample()
-        Prec = self.decode(q_z_sample)
-        if output_type == 'aa': Prec = VPoser.matrot2aa(Prec)
+        # if input_type == 'aa': pose_input = VPoser.aa2matrot(pose_input)
+        latent_distribution = self.encode(pose_input)
+        sampled_latent = latent_distribution.rsample()
+        reconstructed_pose = self.decode(sampled_latent)
+        if output_type == 'aa':
+            reconstructed_pose = VPoser.matrot2aa(reconstructed_pose)
 
-        #return Prec, q_z.mean, q_z.sigma
-        return {'pose':Prec, 'mean':q_z.mean, 'std':q_z.scale}
+        # return reconstructed_pose, latent_distribution.mean, latent_distribution.sigma
+        return {
+            'pose': reconstructed_pose,
+            'mean': latent_distribution.mean,
+            'std': latent_distribution.scale}
 
-    def sample_poses(self, num_poses, output_type='aa', seed=None):
+    def sample_poses(self, pose_count=None, output_type='aa', seed=None,
+                     **legacy_kwargs):
+        if pose_count is None:
+            pose_count = legacy_kwargs.pop('num_poses')
         np.random.seed(seed)
         dtype = self.bodyprior_dec_fc1.weight.dtype
         device = self.bodyprior_dec_fc1.weight.device
         self.eval()
         with torch.no_grad():
-            Zgen = torch.tensor(np.random.normal(0., 1., size=(num_poses, self.latentD)), dtype=dtype).to(device)
-        return self.decode(Zgen, output_type=output_type)
+            generated_latent = torch.tensor(
+                np.random.normal(0., 1., size=(pose_count, self.latent_dimension)),
+                dtype=dtype).to(device)
+        return self.decode(generated_latent, output_type=output_type)
 
     @staticmethod
     def matrot2aa(pose_matrot):
@@ -148,8 +183,9 @@ class VPoser(nn.Module):
         :return: Nx1xnum_jointsx3
         '''
         batch_size = pose_matrot.size(0)
-        homogen_matrot = F.pad(pose_matrot.view(-1, 3, 3), [0,1])
-        pose = tgm.rotation_matrix_to_angle_axis(homogen_matrot).view(batch_size, 1, -1, 3).contiguous()
+        homogeneous_matrix_rotation = F.pad(pose_matrot.view(-1, 3, 3), [0, 1])
+        pose = tgm.rotation_matrix_to_angle_axis(
+            homogeneous_matrix_rotation).view(batch_size, 1, -1, 3).contiguous()
         return pose
 
     @staticmethod
@@ -159,6 +195,7 @@ class VPoser(nn.Module):
         :return: pose_matrot: Nx1xnum_jointsx9
         '''
         batch_size = pose.size(0)
-        pose_body_matrot = tgm.angle_axis_to_rotation_matrix(pose.reshape(-1, 3))[:, :3, :3].contiguous().view(batch_size, 1, -1, 9)
-        return pose_body_matrot
-
+        body_pose_matrix_rotation = tgm.angle_axis_to_rotation_matrix(
+            pose.reshape(-1, 3))[:, :3, :3].contiguous().view(
+                batch_size, 1, -1, 9)
+        return body_pose_matrix_rotation

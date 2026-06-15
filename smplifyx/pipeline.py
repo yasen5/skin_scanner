@@ -37,40 +37,48 @@ import openpose_wrapper
 
 torch.backends.cudnn.enabled = False
 
-Keypoints_fields = ['keypoints', 'gender_gt', 'gender_pd']
+keypoint_fields = ['keypoints', 'gender_gt', 'gender_pd']
 
 
-def datum_to_keypoints(datum, use_hands=True, use_face=True,
-                       use_face_contour=False):
-    """Convert an OpenPose datum to the (N, J, 3) keypoints array that
+def openpose_result_to_keypoints(openpose_result, use_hands=True, use_face=True,
+                                 use_face_contour=False):
+    """Convert an OpenPose result to the (N, J, 3) keypoints array that
     fit_single_frame expects, following the same logic as easy_run.py."""
-    if datum.poseKeypoints is None or len(datum.poseKeypoints) == 0:
+    if (openpose_result.poseKeypoints is None or
+            len(openpose_result.poseKeypoints) == 0):
         return np.zeros((0, 1, 3), dtype=np.float32)
 
-    keypoints = []
-    for idx, body_pose in enumerate(datum.poseKeypoints):
-        body_kp = np.array(body_pose, dtype=np.float32).reshape(-1, 3)
+    all_person_keypoints = []
+    for person_index, body_pose in enumerate(openpose_result.poseKeypoints):
+        body_keypoints = np.array(body_pose, dtype=np.float32).reshape(-1, 3)
 
         if use_hands:
-            lhand = np.array(datum.handKeypoints[0][idx],
-                             dtype=np.float32).reshape(-1, 3)
-            rhand = np.array(datum.handKeypoints[1][idx],
-                             dtype=np.float32).reshape(-1, 3)
-            body_kp = np.concatenate([body_kp, lhand, rhand], axis=0)
+            left_hand_keypoints = np.array(
+                openpose_result.handKeypoints[0][person_index],
+                dtype=np.float32).reshape(-1, 3)
+            right_hand_keypoints = np.array(
+                openpose_result.handKeypoints[1][person_index],
+                dtype=np.float32).reshape(-1, 3)
+            body_keypoints = np.concatenate(
+                [body_keypoints, left_hand_keypoints, right_hand_keypoints],
+                axis=0)
 
         if use_face:
             # 51 FLAME-compatible landmarks starting at offset 17
-            face_kp = np.array(datum.faceKeypoints[idx],
-                               dtype=np.float32).reshape(-1, 3)[17:68, :]
-            contour = np.zeros((0, 3), dtype=np.float32)
+            face_keypoints = np.array(
+                openpose_result.faceKeypoints[person_index],
+                dtype=np.float32).reshape(-1, 3)[17:68, :]
+            contour_keypoints = np.zeros((0, 3), dtype=np.float32)
             if use_face_contour:
-                contour = np.array(datum.faceKeypoints[idx],
-                                   dtype=np.float32).reshape(-1, 3)[:17, :]
-            body_kp = np.concatenate([body_kp, face_kp, contour], axis=0)
+                contour_keypoints = np.array(
+                    openpose_result.faceKeypoints[person_index],
+                    dtype=np.float32).reshape(-1, 3)[:17, :]
+            body_keypoints = np.concatenate(
+                [body_keypoints, face_keypoints, contour_keypoints], axis=0)
 
-        keypoints.append(body_kp)
+        all_person_keypoints.append(body_keypoints)
 
-    return np.stack(keypoints)   # (N_persons, J, 3)
+    return np.stack(all_person_keypoints)   # (N_persons, J, 3)
 
 
 def setup_smplx(args, dtype, device):
@@ -87,7 +95,10 @@ def setup_smplx(args, dtype, device):
                          openpose_format=args.get('openpose_format', 'coco25')))
 
     # Build model_params without 'gender' so we can pass it explicitly per model
-    args_no_gender = {k: v for k, v in args.items() if k != 'gender'}
+    args_without_gender = {
+        argument_name: argument_value
+        for argument_name, argument_value in args.items()
+        if argument_name != 'gender'}
     model_params = dict(
         model_path=args.get('model_folder'),
         joint_mapper=joint_mapper,
@@ -102,7 +113,7 @@ def setup_smplx(args, dtype, device):
         create_reye_pose=True,
         create_transl=False,
         dtype=dtype,
-        **args_no_gender)
+        **args_without_gender)
 
     neutral_model = smplx.create(gender='neutral', **model_params)
     male_model = smplx.create(gender='male', **model_params)
@@ -127,33 +138,33 @@ def setup_smplx(args, dtype, device):
 
     left_hand_prior = right_hand_prior = None
     if use_hands:
-        lhand_args = {**args, 'num_gaussians': args.get('num_pca_comps')}
+        left_hand_args = {**args, 'num_gaussians': args.get('num_pca_comps')}
         left_hand_prior = create_prior(
             prior_type=args.get('left_hand_prior_type'),
-            dtype=dtype, use_left_hand=True, **lhand_args)
-        rhand_args = {**args, 'num_gaussians': args.get('num_pca_comps')}
+            dtype=dtype, use_left_hand=True, **left_hand_args)
+        right_hand_args = {**args, 'num_gaussians': args.get('num_pca_comps')}
         right_hand_prior = create_prior(
             prior_type=args.get('right_hand_prior_type'),
-            dtype=dtype, use_right_hand=True, **rhand_args)
+            dtype=dtype, use_right_hand=True, **right_hand_args)
 
     shape_prior = create_prior(prior_type=args.get('shape_prior_type', 'l2'),
                                dtype=dtype, **args)
     angle_prior = create_prior(prior_type='angle', dtype=dtype)
 
     # Joint weights: one per OpenPose joint
-    num_joints = (25 + 2 * 20 * use_hands)
+    joint_count = (25 + 2 * 20 * use_hands)
     optim_weights = np.ones(
-        num_joints + 2 * use_hands + use_face * 51, dtype=np.float32)
-    joints_to_ign = args.get('joints_to_ign')
-    if joints_to_ign and -1 not in joints_to_ign:
-        optim_weights[joints_to_ign] = 0.0
+        joint_count + 2 * use_hands + use_face * 51, dtype=np.float32)
+    ignored_joints = args.get('joints_to_ign')
+    if ignored_joints and -1 not in ignored_joints:
+        optim_weights[ignored_joints] = 0.0
     joint_weights = torch.tensor(optim_weights, dtype=dtype, device=device)
     joint_weights = joint_weights.unsqueeze(0)
 
     # Move to device
-    for obj in [camera, neutral_model, male_model, female_model,
-                body_pose_prior, angle_prior, shape_prior]:
-        obj.to(device=device)
+    for model_or_prior in [camera, neutral_model, male_model, female_model,
+                           body_pose_prior, angle_prior, shape_prior]:
+        model_or_prior.to(device=device)
     if use_face:
         expr_prior.to(device=device)
         jaw_prior.to(device=device)
@@ -185,13 +196,13 @@ def main(**args):
     os.makedirs(output_folder, exist_ok=True)
     result_folder = osp.join(output_folder, args.pop('result_folder', 'results'))
     mesh_folder = osp.join(output_folder, args.pop('mesh_folder', 'meshes'))
-    img_out_folder = osp.join(output_folder, 'images')
-    for d in [result_folder, mesh_folder, img_out_folder]:
-        os.makedirs(d, exist_ok=True)
+    image_output_folder = osp.join(output_folder, 'images')
+    for folder_path in [result_folder, mesh_folder, image_output_folder]:
+        os.makedirs(folder_path, exist_ok=True)
 
     # Save config
-    with open(osp.join(output_folder, 'conf.yaml'), 'w') as f:
-        yaml.dump(args, f)
+    with open(osp.join(output_folder, 'conf.yaml'), 'w') as config_file:
+        yaml.dump(args, config_file)
 
     float_dtype = args.get('float_dtype', 'float32')
     dtype = torch.float64 if float_dtype == 'float64' else torch.float32
@@ -208,27 +219,27 @@ def main(**args):
 
     # --- Detect keypoints ---
     print(f'Detecting keypoints in {image_path} ...')
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
+    image_bgr = cv2.imread(image_path)
+    if image_bgr is None:
         raise FileNotFoundError(f'Cannot read image: {image_path}')
-    img_rgb = img_bgr.astype(np.float32)[:, :, ::-1] / 255.0
+    image_rgb = image_bgr.astype(np.float32)[:, :, ::-1] / 255.0
 
-    datum = openpose_wrapper.detect_keypoints(img_bgr)
+    openpose_result = openpose_wrapper.detect_keypoints(image_bgr)
 
     use_hands = args.get('use_hands', True)
     use_face = args.get('use_face', True)
-    keypoints = datum_to_keypoints(datum, use_hands=use_hands,
-                                   use_face=use_face)
+    keypoints = openpose_result_to_keypoints(
+        openpose_result, use_hands=use_hands, use_face=use_face)
 
-    n_persons = keypoints.shape[0]
-    print(f'Detected {n_persons} person(s)')
-    if n_persons == 0:
+    person_count = keypoints.shape[0]
+    print(f'Detected {person_count} person(s)')
+    if person_count == 0:
         print('No people detected — exiting.')
         return
 
     if max_persons > 0:
         keypoints = keypoints[:max_persons]
-        n_persons = keypoints.shape[0]
+        person_count = keypoints.shape[0]
 
     # --- Set up SMPLify-X ---
     print('Setting up SMPLify-X models ...')
@@ -236,8 +247,8 @@ def main(**args):
 
     # --- Fit each person ---
     input_gender = args.get('gender', 'neutral')
-    gender_lbl_type = args.get('gender_lbl_type', 'none')
-    _gender_models = {
+    gender_label_type = args.get('gender_lbl_type', 'none')
+    gender_models = {
         'neutral': setup['neutral_model'],
         'male': setup['male_model'],
         'female': setup['female_model'],
@@ -247,28 +258,28 @@ def main(**args):
     result_keypoints = []   # parallel to result_paths
     result_genders = []     # parallel to result_paths
 
-    for person_id in range(n_persons):
-        print(f'\nFitting person {person_id} / {n_persons - 1} ...')
-        result_fn = osp.join(result_folder, f'{person_id:03d}.pkl')
-        mesh_fn = osp.join(mesh_folder, f'{person_id:03d}.obj')
-        per_img_folder = osp.join(img_out_folder, f'{person_id:03d}')
-        os.makedirs(per_img_folder, exist_ok=True)
-        out_img_fn = osp.join(per_img_folder, 'output.png')
+    for person_id in range(person_count):
+        print(f'\nFitting person {person_id} / {person_count - 1} ...')
+        result_path = osp.join(result_folder, f'{person_id:03d}.pkl')
+        mesh_path = osp.join(mesh_folder, f'{person_id:03d}.obj')
+        person_image_folder = osp.join(image_output_folder, f'{person_id:03d}')
+        os.makedirs(person_image_folder, exist_ok=True)
+        output_image_path = osp.join(person_image_folder, 'output.png')
 
         # Select gender: detector output > ground truth label > configured default
         gender = input_gender
-        if (getattr(datum, 'gender_pd', None) and
-                person_id < len(datum.gender_pd)):
-            gender = datum.gender_pd[person_id]
-        elif (gender_lbl_type == 'gt' and
-              getattr(datum, 'gender_gt', None) and
-              person_id < len(datum.gender_gt)):
-            gender = datum.gender_gt[person_id]
-        body_model = _gender_models.get(gender, setup['neutral_model'])
+        if (getattr(openpose_result, 'gender_pd', None) and
+                person_id < len(openpose_result.gender_pd)):
+            gender = openpose_result.gender_pd[person_id]
+        elif (gender_label_type == 'gt' and
+              getattr(openpose_result, 'gender_gt', None) and
+              person_id < len(openpose_result.gender_gt)):
+            gender = openpose_result.gender_gt[person_id]
+        body_model = gender_models.get(gender, setup['neutral_model'])
         print(f'  Using {gender} body model')
 
         fit_single_frame(
-            img_rgb,
+            image_rgb,
             keypoints[[person_id]],
             body_model=body_model,
             camera=setup['camera'],
@@ -276,9 +287,9 @@ def main(**args):
             dtype=dtype,
             output_folder=output_folder,
             result_folder=result_folder,
-            out_img_fn=out_img_fn,
-            result_fn=result_fn,
-            mesh_fn=mesh_fn,
+            out_img_fn=output_image_path,
+            result_fn=result_path,
+            mesh_fn=mesh_path,
             shape_prior=setup['shape_prior'],
             expr_prior=setup['expr_prior'],
             body_pose_prior=setup['body_pose_prior'],
@@ -288,14 +299,14 @@ def main(**args):
             angle_prior=setup['angle_prior'],
             **args)
 
-        if osp.exists(result_fn):
-            result_paths.append(result_fn)
+        if osp.exists(result_path):
+            result_paths.append(result_path)
             result_keypoints.append(keypoints[person_id])   # (J, 3)
             result_genders.append(gender)
 
     # --- Composite render ---
     if result_paths:
-        composite_path = osp.join(img_out_folder, 'composite.png')
+        composite_path = osp.join(image_output_folder, 'composite.png')
         print(f'\nRendering composite of {len(result_paths)} person(s) ...')
         render_multi_person(result_paths, image_path, composite_path,
                             focal_length=float(args.get('focal_length', 5000)),
@@ -306,11 +317,11 @@ def main(**args):
 
 
 if __name__ == '__main__':
-    import argparse as _ap
-    _pre = _ap.ArgumentParser(add_help=False)
-    _pre.add_argument('--image', required=True,
-                      help='Input image path (single multi-person image)')
-    _pre_args, _remaining = _pre.parse_known_args()
-    args = parse_config(_remaining)
-    args['image'] = _pre_args.image
+    import argparse as argparse_module
+    pre_parser = argparse_module.ArgumentParser(add_help=False)
+    pre_parser.add_argument('--image', required=True,
+                            help='Input image path (single multi-person image)')
+    pre_args, remaining_args = pre_parser.parse_known_args()
+    args = parse_config(remaining_args)
+    args['image'] = pre_args.image
     main(**args)

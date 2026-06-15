@@ -69,20 +69,25 @@ def silhouette_edges(faces, camera_vertices):
     return np.asarray(outline, dtype=np.int64)
 
 
-def draw_edges(draw, projected, edges, color, width, image_size):
+def draw_edges(draw, projected_vertices, edges, color, width, image_size):
     image_width, image_height = image_size
     for start, end in edges:
-        p0 = projected[start]
-        p1 = projected[end]
-        if not np.isfinite(p0).all() or not np.isfinite(p1).all():
+        start_point = projected_vertices[start]
+        end_point = projected_vertices[end]
+        if not np.isfinite(start_point).all() or not np.isfinite(end_point).all():
             continue
-        if ((p0[0] < -image_width and p1[0] < -image_width) or
-                (p0[0] > image_width * 2 and p1[0] > image_width * 2) or
-                (p0[1] < -image_height and p1[1] < -image_height) or
-                (p0[1] > image_height * 2 and p1[1] > image_height * 2)):
+        if ((start_point[0] < -image_width and end_point[0] < -image_width) or
+                (start_point[0] > image_width * 2 and
+                 end_point[0] > image_width * 2) or
+                (start_point[1] < -image_height and
+                 end_point[1] < -image_height) or
+                (start_point[1] > image_height * 2 and
+                 end_point[1] > image_height * 2)):
             continue
-        draw.line((float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1])),
-                  fill=color, width=width)
+        draw.line(
+            (float(start_point[0]), float(start_point[1]),
+             float(end_point[0]), float(end_point[1])),
+            fill=color, width=width)
 
 
 if __name__ == '__main__':
@@ -100,8 +105,8 @@ if __name__ == '__main__':
                         help='Which projected mesh lines to draw')
     args, remaining = parser.parse_known_args()
 
-    cfg = parse_config(remaining)
-    focal_length = float(cfg.get('focal_length', 5000.0))
+    config = parse_config(remaining)
+    focal_length = float(config.get('focal_length', 5000.0))
 
     image = ImageOps.exif_transpose(Image.open(args.image)).convert('RGBA')
     image_size = image.size
@@ -134,8 +139,9 @@ if __name__ == '__main__':
     output.save(args.out)
 
     finite = np.isfinite(projected).all(axis=1)
-    bbox = np.vstack([projected[finite].min(axis=0),
-                      projected[finite].max(axis=0)])
+    bounding_box = np.vstack([projected[finite].min(axis=0),
+                              projected[finite].max(axis=0)])
     print('Wrote {}'.format(args.out))
-    print('Projected mesh bbox: [{:.1f}, {:.1f}] to [{:.1f}, {:.1f}]'.format(
-        bbox[0, 0], bbox[0, 1], bbox[1, 0], bbox[1, 1]))
+    print('Projected mesh bounding box: [{:.1f}, {:.1f}] to [{:.1f}, {:.1f}]'.format(
+        bounding_box[0, 0], bounding_box[0, 1],
+        bounding_box[1, 0], bounding_box[1, 1]))

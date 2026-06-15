@@ -39,10 +39,10 @@ def infer_mesh_path(result_path):
 
 def exported_obj_to_model_space(vertices):
     """SMPLify-X exports OBJ meshes after a 180-degree rotation around X."""
-    v = vertices.copy()
-    v[:, 1] *= -1.0
-    v[:, 2] *= -1.0
-    return v
+    model_vertices = vertices.copy()
+    model_vertices[:, 1] *= -1.0
+    model_vertices[:, 2] *= -1.0
+    return model_vertices
 
 
 def project_vertices(vertices, camera_rotation, camera_translation,
@@ -84,20 +84,25 @@ def silhouette_edges(faces, camera_vertices):
     return np.asarray(outline, dtype=np.int64)
 
 
-def draw_edges(draw, projected, edges, color, width, image_size):
+def draw_edges(draw, projected_vertices, edges, color, width, image_size):
     image_width, image_height = image_size
     for start, end in edges:
-        p0 = projected[start]
-        p1 = projected[end]
-        if not np.isfinite(p0).all() or not np.isfinite(p1).all():
+        start_point = projected_vertices[start]
+        end_point = projected_vertices[end]
+        if not np.isfinite(start_point).all() or not np.isfinite(end_point).all():
             continue
-        if ((p0[0] < -image_width and p1[0] < -image_width) or
-                (p0[0] > image_width * 2 and p1[0] > image_width * 2) or
-                (p0[1] < -image_height and p1[1] < -image_height) or
-                (p0[1] > image_height * 2 and p1[1] > image_height * 2)):
+        if ((start_point[0] < -image_width and end_point[0] < -image_width) or
+                (start_point[0] > image_width * 2 and
+                 end_point[0] > image_width * 2) or
+                (start_point[1] < -image_height and
+                 end_point[1] < -image_height) or
+                (start_point[1] > image_height * 2 and
+                 end_point[1] > image_height * 2)):
             continue
-        draw.line((float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1])),
-                  fill=color, width=width)
+        draw.line(
+            (float(start_point[0]), float(start_point[1]),
+             float(end_point[0]), float(end_point[1])),
+            fill=color, width=width)
 
 
 def _load_font(size=16):
@@ -108,55 +113,64 @@ def _load_font(size=16):
 
 
 # Radii for body / hand / face keypoints
-_KP_RADIUS = {
+_KEYPOINT_RADIUS = {
     'body':  5,
     'hand':  3,
     'face':  2,
 }
-_KP_CONF_THRESH = 0.1
+_KEYPOINT_CONFIDENCE_THRESHOLD = 0.1
 
 # OpenPose COCO-25 body joint count
-_N_BODY = 25
-_N_HAND = 21   # per hand
+_BODY_JOINT_COUNT = 25
+_HAND_JOINT_COUNT = 21   # per hand
 
 
-def _draw_keypoints(draw, kps, color, image_size):
+def _draw_keypoints(draw, keypoints, color, image_size):
     """Draw all keypoints for one person.
 
-    kps: (J, 3) array  —  (x, y, confidence)
+    keypoints: (J, 3) array  —  (x, y, confidence)
     Layout: 0-24 body, 25-45 left hand, 46-66 right hand, 67+ face
     """
-    for j, (x, y, conf) in enumerate(kps):
-        if conf < _KP_CONF_THRESH:
+    for joint_index, keypoint in enumerate(keypoints):
+        x_coordinate, y_coordinate, confidence = keypoint
+        if confidence < _KEYPOINT_CONFIDENCE_THRESHOLD:
             continue
-        if j < _N_BODY:
-            r = _KP_RADIUS['body']
-        elif j < _N_BODY + 2 * _N_HAND:
-            r = _KP_RADIUS['hand']
+        if joint_index < _BODY_JOINT_COUNT:
+            radius = _KEYPOINT_RADIUS['body']
+        elif joint_index < _BODY_JOINT_COUNT + 2 * _HAND_JOINT_COUNT:
+            radius = _KEYPOINT_RADIUS['hand']
         else:
-            r = _KP_RADIUS['face']
-        if not (np.isfinite(x) and np.isfinite(y)):
+            radius = _KEYPOINT_RADIUS['face']
+        if not (np.isfinite(x_coordinate) and np.isfinite(y_coordinate)):
             continue
         draw.ellipse(
-            [(x - r, y - r), (x + r, y + r)],
+            [(x_coordinate - radius, y_coordinate - radius),
+             (x_coordinate + radius, y_coordinate + radius)],
             fill=(*color, 220),
             outline=(*color, 255),
         )
 
 
-def _label_position(kps):
+def _label_position(keypoints):
     """Return (x, y) for the gender label — above the visible body keypoints."""
-    body_kps = kps[:_N_BODY]
-    visible = body_kps[body_kps[:, 2] >= _KP_CONF_THRESH]
-    if len(visible) == 0:
-        visible = kps[kps[:, 2] >= _KP_CONF_THRESH]
-    if len(visible) == 0:
+    body_keypoints = keypoints[:_BODY_JOINT_COUNT]
+    visible_keypoints = body_keypoints[
+        body_keypoints[:, 2] >= _KEYPOINT_CONFIDENCE_THRESHOLD]
+    if len(visible_keypoints) == 0:
+        visible_keypoints = keypoints[
+            keypoints[:, 2] >= _KEYPOINT_CONFIDENCE_THRESHOLD]
+    if len(visible_keypoints) == 0:
         return None
     # Nose or neck preferred (joints 0 and 1) for a natural label position
-    for idx in (0, 1, 15, 16):
-        if idx < len(kps) and kps[idx, 2] >= _KP_CONF_THRESH:
-            return float(kps[idx, 0]), float(kps[idx, 1]) - 18
-    return float(visible[:, 0].mean()), float(visible[:, 1].min()) - 18
+    for joint_index in (0, 1, 15, 16):
+        if (joint_index < len(keypoints) and
+                keypoints[joint_index, 2] >= _KEYPOINT_CONFIDENCE_THRESHOLD):
+            return (
+                float(keypoints[joint_index, 0]),
+                float(keypoints[joint_index, 1]) - 18)
+    return (
+        float(visible_keypoints[:, 0].mean()),
+        float(visible_keypoints[:, 1].min()) - 18)
 
 
 def render_multi_person(result_paths, image_path, output_path,
@@ -169,50 +183,57 @@ def render_multi_person(result_paths, image_path, output_path,
     draw = ImageDraw.Draw(overlay)
     font = _load_font(size=16)
 
-    for i, pkl_path in enumerate(sorted(result_paths)):
-        with open(pkl_path, 'rb') as f:
-            result = pickle.load(f, encoding='latin1')
+    for person_index, result_path in enumerate(sorted(result_paths)):
+        with open(result_path, 'rb') as result_file:
+            result = pickle.load(result_file, encoding='latin1')
 
-        mesh_path = infer_mesh_path(pkl_path)
-        c = PERSON_COLORS[i % len(PERSON_COLORS)]
+        mesh_path = infer_mesh_path(result_path)
+        person_color = PERSON_COLORS[person_index % len(PERSON_COLORS)]
 
         if not osp.exists(mesh_path):
-            print(f'Mesh not found for person {i}: {mesh_path}')
+            print(f'Mesh not found for person {person_index}: {mesh_path}')
         else:
             mesh = trimesh.load(mesh_path, process=False)
             vertices = exported_obj_to_model_space(np.asarray(mesh.vertices))
             faces = np.asarray(mesh.faces)
 
-            R = np.asarray(result['camera_rotation']).reshape(3, 3)
-            t = np.asarray(result['camera_translation']).reshape(3)
+            camera_rotation = np.asarray(result['camera_rotation']).reshape(3, 3)
+            camera_translation = np.asarray(result['camera_translation']).reshape(3)
 
-            projected, cam_verts = project_vertices(
-                vertices, R, t, focal_length, image.size)
+            projected_vertices, camera_vertices = project_vertices(
+                vertices, camera_rotation, camera_translation,
+                focal_length, image.size)
 
-            draw_edges(draw, projected, mesh_edges(faces),
-                       color=(*c, 75), width=1, image_size=image.size)
-            draw_edges(draw, projected, silhouette_edges(faces, cam_verts),
-                       color=(*c, 230), width=2, image_size=image.size)
+            draw_edges(draw, projected_vertices, mesh_edges(faces),
+                       color=(*person_color, 75), width=1, image_size=image.size)
+            draw_edges(draw, projected_vertices,
+                       silhouette_edges(faces, camera_vertices),
+                       color=(*person_color, 230), width=2, image_size=image.size)
 
         # Draw OpenPose keypoints
-        if keypoints_per_person is not None and i < len(keypoints_per_person):
-            kps = np.asarray(keypoints_per_person[i])   # (J, 3)
-            _draw_keypoints(draw, kps, c, image.size)
+        if (keypoints_per_person is not None and
+                person_index < len(keypoints_per_person)):
+            keypoints = np.asarray(keypoints_per_person[person_index])   # (J, 3)
+            _draw_keypoints(draw, keypoints, person_color, image.size)
 
             # Draw gender label
-            gender = genders[i] if (genders is not None and i < len(genders)) \
-                else 'neutral'
-            pos = _label_position(kps)
-            if pos is not None:
-                x, y = pos
+            gender = (
+                genders[person_index]
+                if (genders is not None and person_index < len(genders))
+                else 'neutral')
+            label_position = _label_position(keypoints)
+            if label_position is not None:
+                x_coordinate, y_coordinate = label_position
                 label = gender
                 # Dark shadow for readability
-                draw.text((x + 1, y + 1), label, font=font,
+                draw.text((x_coordinate + 1, y_coordinate + 1), label, font=font,
                           fill=(0, 0, 0, 200))
-                draw.text((x, y), label, font=font,
-                          fill=(*c, 255))
+                draw.text((x_coordinate, y_coordinate), label, font=font,
+                          fill=(*person_color, 255))
 
-        print(f'Rendered person {i} ({osp.basename(pkl_path)}) in color {c}')
+        print(
+            f'Rendered person {person_index} ({osp.basename(result_path)}) '
+            f'in color {person_color}')
 
     output = Image.alpha_composite(image, overlay).convert('RGB')
     os.makedirs(osp.dirname(output_path) or '.', exist_ok=True)
@@ -231,8 +252,8 @@ if __name__ == '__main__':
     parser.add_argument('--focal_length', type=float, default=5000.0)
     args = parser.parse_args()
 
-    pkl_files = sorted(glob.glob(osp.join(args.results_dir, '*.pkl')))
-    if not pkl_files:
+    result_files = sorted(glob.glob(osp.join(args.results_dir, '*.pkl')))
+    if not result_files:
         raise FileNotFoundError(f'No .pkl files found in {args.results_dir}')
 
-    render_multi_person(pkl_files, args.image, args.out, args.focal_length)
+    render_multi_person(result_files, args.image, args.out, args.focal_length)
