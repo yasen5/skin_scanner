@@ -41,14 +41,14 @@ ftol: 1e-9
 gtol: 1e-9
 lr: 1.0
 # Max number of optimization iterations
-maxiters: 30
+maxiters: 100
 interactive: True
 visualize: False
 # Relative change in loss value
 body_pose_prior_weights:
-    - 4.04e2
-    - 4.04e2
-    - 57.4e0
+    - 4.78e0
+    - 4.78e0
+    - 4.78e0
     - 4.78e0
     - 4.78e0
 coll_loss_weights:

@@ -197,10 +197,14 @@ def main(**args):
     dtype = torch.float64 if float_dtype == 'float64' else torch.float32
     device = torch.device('cpu')   # CPU-only on macOS
 
-    # mesh_intersection (interpenetration loss) requires CUDA — disable on CPU
-    if not torch.cuda.is_available() and args.get('interpenetration', False):
-        print('CUDA not available — disabling interpenetration loss.')
-        args['interpenetration'] = False
+    # Force CPU-only when CUDA is unavailable (e.g., macOS)
+    if not torch.cuda.is_available():
+        if args.get('use_cuda', False):
+            print('CUDA not available — switching to CPU.')
+            args['use_cuda'] = False
+        if args.get('interpenetration', False):
+            print('CUDA not available — disabling interpenetration loss.')
+            args['interpenetration'] = False
 
     # --- Detect keypoints ---
     print(f'Detecting keypoints in {image_path} ...')

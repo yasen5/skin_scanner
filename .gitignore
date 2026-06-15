@@ -107,3 +107,4 @@ venv.bak/
 # mypy
 .mypy_cache/
 smplx_output/
+smplx_output_5ppl/
