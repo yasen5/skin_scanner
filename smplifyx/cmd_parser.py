@@ -37,7 +37,7 @@ def parse_config(argv=None):
     parser.add_argument('--data_folder',
                         default=os.getcwd(),
                         help='The directory that contains the data.')
-    parser.add_argument('--max_persons', type=int, default=3,
+    parser.add_argument('--max_persons', type=int, default=-1,
                         help='The maximum number of persons to process')
     parser.add_argument('-c', '--config',
                         required=True, is_config_file=True,
