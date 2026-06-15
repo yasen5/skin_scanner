@@ -14,7 +14,6 @@ The public API is identical to the playing_smplifyx openpose_wrapper.py:
 
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
 from PIL import Image
 
 from controlnet_aux.open_pose import OpenposeDetector
@@ -105,70 +104,6 @@ def _coco18_to_body25(coco18_keypoints, image_height, image_width):
     return body25_keypoints
 
 
-def _remap_hf_to_timm(hf_weights):
-    """Convert rizvandwiki/gender-classification Transformers ViT weights to timm layout.
-
-    The key difference is that HF stores Q, K, V as separate linear layers while
-    timm merges them into a single QKV projection (shape [3*D, D]).
-    """
-    timm_state_dict = {}
-
-    direct_key_map = {
-        'classifier.weight':                              'head.weight',
-        'classifier.bias':                                'head.bias',
-        'vit.embeddings.cls_token':                       'cls_token',
-        'vit.embeddings.patch_embeddings.projection.weight': 'patch_embed.proj.weight',
-        'vit.embeddings.patch_embeddings.projection.bias':   'patch_embed.proj.bias',
-        'vit.embeddings.position_embeddings':             'pos_embed',
-        'vit.layernorm.weight':                           'norm.weight',
-        'vit.layernorm.bias':                             'norm.bias',
-    }
-    for huggingface_key, timm_key in direct_key_map.items():
-        timm_state_dict[timm_key] = hf_weights[huggingface_key]
-
-    for layer_index in range(12):
-        huggingface_prefix = f'vit.encoder.layer.{layer_index}'
-        timm_prefix = f'blocks.{layer_index}'
-
-        timm_state_dict[f'{timm_prefix}.norm1.weight'] = (
-            hf_weights[f'{huggingface_prefix}.layernorm_before.weight'])
-        timm_state_dict[f'{timm_prefix}.norm1.bias'] = (
-            hf_weights[f'{huggingface_prefix}.layernorm_before.bias'])
-
-        query_weight = hf_weights[f'{huggingface_prefix}.attention.attention.query.weight']
-        key_weight = hf_weights[f'{huggingface_prefix}.attention.attention.key.weight']
-        value_weight = hf_weights[f'{huggingface_prefix}.attention.attention.value.weight']
-        timm_state_dict[f'{timm_prefix}.attn.qkv.weight'] = torch.cat(
-            [query_weight, key_weight, value_weight], dim=0)
-
-        query_bias = hf_weights[f'{huggingface_prefix}.attention.attention.query.bias']
-        key_bias = hf_weights[f'{huggingface_prefix}.attention.attention.key.bias']
-        value_bias = hf_weights[f'{huggingface_prefix}.attention.attention.value.bias']
-        timm_state_dict[f'{timm_prefix}.attn.qkv.bias'] = torch.cat(
-            [query_bias, key_bias, value_bias], dim=0)
-
-        timm_state_dict[f'{timm_prefix}.attn.proj.weight'] = (
-            hf_weights[f'{huggingface_prefix}.attention.output.dense.weight'])
-        timm_state_dict[f'{timm_prefix}.attn.proj.bias'] = (
-            hf_weights[f'{huggingface_prefix}.attention.output.dense.bias'])
-
-        timm_state_dict[f'{timm_prefix}.norm2.weight'] = (
-            hf_weights[f'{huggingface_prefix}.layernorm_after.weight'])
-        timm_state_dict[f'{timm_prefix}.norm2.bias'] = (
-            hf_weights[f'{huggingface_prefix}.layernorm_after.bias'])
-
-        timm_state_dict[f'{timm_prefix}.mlp.fc1.weight'] = (
-            hf_weights[f'{huggingface_prefix}.intermediate.dense.weight'])
-        timm_state_dict[f'{timm_prefix}.mlp.fc1.bias'] = (
-            hf_weights[f'{huggingface_prefix}.intermediate.dense.bias'])
-
-        timm_state_dict[f'{timm_prefix}.mlp.fc2.weight'] = (
-            hf_weights[f'{huggingface_prefix}.output.dense.weight'])
-        timm_state_dict[f'{timm_prefix}.mlp.fc2.bias'] = (
-            hf_weights[f'{huggingface_prefix}.output.dense.bias'])
-
-    return timm_state_dict
-
 
 def _crop_person(image_rgb, body25_keypoints, padding_fraction=0.15):
     """Return a tight bounding-box crop of one person using their BODY_25 keypoints.
@@ -196,27 +131,16 @@ def _crop_person(image_rgb, body25_keypoints, padding_fraction=0.15):
 
 
 class _GenderClassifier:
-    """ViT-B/16 gender classifier loaded from rizvandwiki/gender-classification.
+    """ViT-B/16 gender classifier loaded from rizvandwiki/gender-classification."""
 
-    Weights are remapped from HuggingFace Transformers format to timm format so
-    no `transformers` dependency is required — only timm + safetensors.
-    """
-
-    _REPO   = 'rizvandwiki/gender-classification'
-    _LABELS = ['female', 'male']   # id2label: {0: female, 1: male}
+    _REPO = 'rizvandwiki/gender-classification'
 
     def __init__(self):
-        import timm
-        import safetensors.torch
-        from huggingface_hub import hf_hub_download
+        from transformers import AutoImageProcessor, AutoModelForImageClassification
 
         print('Loading gender classifier from HuggingFace Hub ...')
-        weights_path = hf_hub_download(self._REPO, 'model.safetensors')
-        hf_weights = safetensors.torch.load_file(weights_path)
-
-        self._model = timm.create_model(
-            'vit_base_patch16_224', pretrained=False, num_classes=2)
-        self._model.load_state_dict(_remap_hf_to_timm(hf_weights))
+        self._processor = AutoImageProcessor.from_pretrained(self._REPO)
+        self._model = AutoModelForImageClassification.from_pretrained(self._REPO)
         self._model.eval()
 
     def predict(self, image_rgb_uint8, body25_keypoints):
@@ -228,24 +152,12 @@ class _GenderClassifier:
         if crop is None:
             return 'neutral'
 
-        # Pad to square before resizing to avoid aspect-ratio distortion
-        crop_height, crop_width = crop.shape[:2]
-        square_side = max(crop_height, crop_width)
-        padded_crop = np.zeros((square_side, square_side, 3), dtype=np.uint8)
-        padded_crop[
-            (square_side - crop_height) // 2:
-            (square_side - crop_height) // 2 + crop_height,
-            (square_side - crop_width) // 2:
-            (square_side - crop_width) // 2 + crop_width] = crop
-        crop_image = Image.fromarray(padded_crop).resize((224, 224), Image.BILINEAR)
-        image_tensor = TF.to_tensor(crop_image)                            # [0, 1]
-        image_tensor = TF.normalize(
-            image_tensor, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])   # [-1, 1]
-        image_tensor = image_tensor.unsqueeze(0)
-
+        inputs = self._processor(
+            images=Image.fromarray(crop), return_tensors='pt')
         with torch.no_grad():
-            predicted_label_index = self._model(image_tensor).argmax(dim=1).item()
-        return self._LABELS[predicted_label_index]
+            logits = self._model(**inputs).logits
+        predicted_label_index = logits.argmax(-1).item()
+        return self._model.config.id2label[predicted_label_index]
 
 
 _gender_clf = None   # loaded lazily on first call to detect_keypoints
