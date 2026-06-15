@@ -16,7 +16,7 @@ import pickle
 
 import numpy as np
 import trimesh
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Distinct colours per person (RGB, 0-255)
 PERSON_COLORS = [
@@ -100,37 +100,118 @@ def draw_edges(draw, projected, edges, color, width, image_size):
                   fill=color, width=width)
 
 
+def _load_font(size=16):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+# Radii for body / hand / face keypoints
+_KP_RADIUS = {
+    'body':  5,
+    'hand':  3,
+    'face':  2,
+}
+_KP_CONF_THRESH = 0.1
+
+# OpenPose COCO-25 body joint count
+_N_BODY = 25
+_N_HAND = 21   # per hand
+
+
+def _draw_keypoints(draw, kps, color, image_size):
+    """Draw all keypoints for one person.
+
+    kps: (J, 3) array  —  (x, y, confidence)
+    Layout: 0-24 body, 25-45 left hand, 46-66 right hand, 67+ face
+    """
+    for j, (x, y, conf) in enumerate(kps):
+        if conf < _KP_CONF_THRESH:
+            continue
+        if j < _N_BODY:
+            r = _KP_RADIUS['body']
+        elif j < _N_BODY + 2 * _N_HAND:
+            r = _KP_RADIUS['hand']
+        else:
+            r = _KP_RADIUS['face']
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        draw.ellipse(
+            [(x - r, y - r), (x + r, y + r)],
+            fill=(*color, 220),
+            outline=(*color, 255),
+        )
+
+
+def _label_position(kps):
+    """Return (x, y) for the gender label — above the visible body keypoints."""
+    body_kps = kps[:_N_BODY]
+    visible = body_kps[body_kps[:, 2] >= _KP_CONF_THRESH]
+    if len(visible) == 0:
+        visible = kps[kps[:, 2] >= _KP_CONF_THRESH]
+    if len(visible) == 0:
+        return None
+    # Nose or neck preferred (joints 0 and 1) for a natural label position
+    for idx in (0, 1, 15, 16):
+        if idx < len(kps) and kps[idx, 2] >= _KP_CONF_THRESH:
+            return float(kps[idx, 0]), float(kps[idx, 1]) - 18
+    return float(visible[:, 0].mean()), float(visible[:, 1].min()) - 18
+
+
 def render_multi_person(result_paths, image_path, output_path,
-                        focal_length=5000.0):
-    """Overlay each person's fitted mesh onto the image with a distinct colour."""
+                        focal_length=5000.0,
+                        keypoints_per_person=None,
+                        genders=None):
+    """Overlay each person's fitted mesh, keypoints, and gender label."""
     image = ImageOps.exif_transpose(Image.open(image_path)).convert('RGBA')
     overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
+    font = _load_font(size=16)
 
     for i, pkl_path in enumerate(sorted(result_paths)):
         with open(pkl_path, 'rb') as f:
             result = pickle.load(f, encoding='latin1')
 
         mesh_path = infer_mesh_path(pkl_path)
+        c = PERSON_COLORS[i % len(PERSON_COLORS)]
+
         if not osp.exists(mesh_path):
             print(f'Mesh not found for person {i}: {mesh_path}')
-            continue
+        else:
+            mesh = trimesh.load(mesh_path, process=False)
+            vertices = exported_obj_to_model_space(np.asarray(mesh.vertices))
+            faces = np.asarray(mesh.faces)
 
-        mesh = trimesh.load(mesh_path, process=False)
-        vertices = exported_obj_to_model_space(np.asarray(mesh.vertices))
-        faces = np.asarray(mesh.faces)
+            R = np.asarray(result['camera_rotation']).reshape(3, 3)
+            t = np.asarray(result['camera_translation']).reshape(3)
 
-        R = np.asarray(result['camera_rotation']).reshape(3, 3)
-        t = np.asarray(result['camera_translation']).reshape(3)
+            projected, cam_verts = project_vertices(
+                vertices, R, t, focal_length, image.size)
 
-        projected, cam_verts = project_vertices(
-            vertices, R, t, focal_length, image.size)
+            draw_edges(draw, projected, mesh_edges(faces),
+                       color=(*c, 75), width=1, image_size=image.size)
+            draw_edges(draw, projected, silhouette_edges(faces, cam_verts),
+                       color=(*c, 230), width=2, image_size=image.size)
 
-        c = PERSON_COLORS[i % len(PERSON_COLORS)]
-        draw_edges(draw, projected, mesh_edges(faces),
-                   color=(*c, 75), width=1, image_size=image.size)
-        draw_edges(draw, projected, silhouette_edges(faces, cam_verts),
-                   color=(*c, 230), width=2, image_size=image.size)
+        # Draw OpenPose keypoints
+        if keypoints_per_person is not None and i < len(keypoints_per_person):
+            kps = np.asarray(keypoints_per_person[i])   # (J, 3)
+            _draw_keypoints(draw, kps, c, image.size)
+
+            # Draw gender label
+            gender = genders[i] if (genders is not None and i < len(genders)) \
+                else 'neutral'
+            pos = _label_position(kps)
+            if pos is not None:
+                x, y = pos
+                label = gender
+                # Dark shadow for readability
+                draw.text((x + 1, y + 1), label, font=font,
+                          fill=(0, 0, 0, 200))
+                draw.text((x, y), label, font=font,
+                          fill=(*c, 255))
+
         print(f'Rendered person {i} ({osp.basename(pkl_path)}) in color {c}')
 
     output = Image.alpha_composite(image, overlay).convert('RGB')

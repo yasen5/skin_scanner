@@ -235,7 +235,18 @@ def main(**args):
     setup = setup_smplx(args, dtype, device)
 
     # --- Fit each person ---
+    input_gender = args.get('gender', 'neutral')
+    gender_lbl_type = args.get('gender_lbl_type', 'none')
+    _gender_models = {
+        'neutral': setup['neutral_model'],
+        'male': setup['male_model'],
+        'female': setup['female_model'],
+    }
+
     result_paths = []
+    result_keypoints = []   # parallel to result_paths
+    result_genders = []     # parallel to result_paths
+
     for person_id in range(n_persons):
         print(f'\nFitting person {person_id} / {n_persons - 1} ...')
         result_fn = osp.join(result_folder, f'{person_id:03d}.pkl')
@@ -244,10 +255,21 @@ def main(**args):
         os.makedirs(per_img_folder, exist_ok=True)
         out_img_fn = osp.join(per_img_folder, 'output.png')
 
+        # Select gender model: prefer per-person label from datum when available
+        gender = input_gender
+        if gender_lbl_type == 'pd' and hasattr(datum, 'gender_pd') and \
+                datum.gender_pd is not None and person_id < len(datum.gender_pd):
+            gender = datum.gender_pd[person_id]
+        elif gender_lbl_type == 'gt' and hasattr(datum, 'gender_gt') and \
+                datum.gender_gt is not None and person_id < len(datum.gender_gt):
+            gender = datum.gender_gt[person_id]
+        body_model = _gender_models.get(gender, setup['neutral_model'])
+        print(f'  Using {gender} body model')
+
         fit_single_frame(
             img_rgb,
             keypoints[[person_id]],
-            body_model=setup['neutral_model'],
+            body_model=body_model,
             camera=setup['camera'],
             joint_weights=setup['joint_weights'],
             dtype=dtype,
@@ -267,13 +289,17 @@ def main(**args):
 
         if osp.exists(result_fn):
             result_paths.append(result_fn)
+            result_keypoints.append(keypoints[person_id])   # (J, 3)
+            result_genders.append(gender)
 
     # --- Composite render ---
     if result_paths:
         composite_path = osp.join(img_out_folder, 'composite.png')
         print(f'\nRendering composite of {len(result_paths)} person(s) ...')
         render_multi_person(result_paths, image_path, composite_path,
-                            focal_length=float(args.get('focal_length', 5000)))
+                            focal_length=float(args.get('focal_length', 5000)),
+                            keypoints_per_person=result_keypoints,
+                            genders=result_genders)
     else:
         print('No results saved — skipping composite render.')
 
